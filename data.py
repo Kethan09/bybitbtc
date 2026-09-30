@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pandas as pd
+import requests
+
+BYBIT_BASE = "https://api.bybit.com"
+
+
+def _get(session: requests.Session, path: str, params: dict) -> dict:
+    for attempt in range(7):
+        try:
+            r = session.get(BYBIT_BASE + path, params=params, timeout=20)
+            r.raise_for_status()
+            payload = r.json()
+            if payload.get("retCode") != 0:
+                raise RuntimeError(f"Bybit API error {payload.get('retCode')}: {payload.get('retMsg')}")
+            return payload
+        except Exception:
+            if attempt == 6:
+                raise
+            time.sleep(min(2 ** attempt, 20))
+    raise RuntimeError("unreachable")
+
+
+def _download_kline(path: str, category: str, symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    rows: list[list[str]] = []
+    cursor = start_ms
+    session = requests.Session()
+    session.headers.update({"User-Agent": "BTCUSDT-Bybit-Odds-Probability-Bot/1.0"})
+
+    while cursor < end_ms:
+        payload = _get(
+            session,
+            path,
+            {
+                "category": category,
+                "symbol": symbol,
+                "interval": interval,
+                "start": cursor,
+                "end": end_ms,
+                "limit": 1000,
+            },
+        )
+        batch = payload["result"]["list"]
+        if not batch:
+            break
+
+        # Bybit returns reverse chronological order.
+        batch = list(reversed(batch))
+        rows.extend(batch)
+        last_start = int(batch[-1][0])
+        next_cursor = last_start + 60_000
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
+        time.sleep(0.08)
+
+        if len(batch) < 1000 and cursor >= end_ms:
+            break
+
+    if not rows:
+        raise RuntimeError(f"Bybit returned no data for {symbol} {interval}")
+
+    cols = ["open_time", "open", "high", "low", "close", "volume", "turnover"]
+    # Index-price-kline returns OHLC + often fewer fields than normal kline.
+    width = len(rows[0])
+    frame = pd.DataFrame(rows, columns=cols[:width])
+    for c in [c for c in frame.columns if c != "open_time"]:
+        frame[c] = pd.to_numeric(frame[c], errors="coerce")
+    frame["open_time"] = pd.to_datetime(frame["open_time"].astype("int64"), unit="ms", utc=True)
+    frame = frame.set_index("open_time").sort_index()
+    frame = frame[~frame.index.duplicated(keep="last")]
+    return frame
+
+
+def download_1m(symbol: str = "BTCUSDT", days: int = 90, cache_file: str | None = None) -> pd.DataFrame:
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+
+    # Index price is the settlement reference for Bybit Odds Up/Down.
+    index_df = _download_kline(
+        "/v5/market/index-price-kline", "linear", symbol, "1", start_ms, end_ms
+    )
+
+    # Linear market kline supplies traded volume features. It is optional for training.
+    market_df = _download_kline(
+        "/v5/market/kline", "linear", symbol, "1", start_ms, end_ms
+    )
+    market_df = market_df.rename(columns={
+        "open": "m_open", "high": "m_high", "low": "m_low", "close": "m_close",
+        "volume": "volume", "turnover": "turnover"
+    })
+
+    df = index_df.join(market_df[[c for c in ["volume", "turnover"] if c in market_df.columns]], how="left")
+    df["volume"] = df.get("volume", pd.Series(index=df.index, dtype=float)).fillna(0.0)
+    df["turnover"] = df.get("turnover", pd.Series(index=df.index, dtype=float)).fillna(0.0)
+    df = df.loc[df.index <= pd.Timestamp.now(tz="UTC").floor("min")]
+
+    if cache_file:
+        p = Path(cache_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(p)
+    return df
+
+
+def load_or_download(symbol: str, days: int, cache_file: str) -> pd.DataFrame:
+    p = Path(cache_file)
+    if p.exists():
+        df = pd.read_parquet(p)
+        df.index = pd.to_datetime(df.index, utc=True)
+        return df.sort_index()
+    return download_1m(symbol, days, cache_file)
